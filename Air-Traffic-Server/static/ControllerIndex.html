@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Control Tower Sim</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: linear-gradient(to bottom, #080172, #000);
+    color: #e2e8f0;
+    font-family: system-ui, sans-serif;
+    min-height: 100vh;
+  }
+  header {
+    padding: 18px 24px;
+    background: rgba(0, 0, 0, 0.3);
+    border-bottom: 1px solid #1a5fb4;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+  }
+  h1 { margin: 0; font-size: 21px; }
+  .muted { color: #8da2b9; font-size: 13px; }
+  .status { color: #1a5fb4; font-size: 13px; }
+  main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 280px;
+    gap: 16px;
+    padding: 16px;
+  }
+  .panel {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid #1a5fb4;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .panel-title {
+    padding: 14px 16px;
+    border-bottom: 1px solid #1a5fb4;
+    font-weight: 650;
+  }
+  #radar {
+    width: 100%;
+    display: block;
+    background: rgba(0, 0, 0, 0.2);
+  }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .stat { padding: 14px; }
+  .number { font-size: 25px; font-weight: 700; }
+  .content { padding: 14px; }
+  .runway {
+    padding: 12px;
+    border-radius: 7px;
+    background: #1b2938;
+    margin-bottom: 10px;
+  }
+  .log {
+    height: 280px;
+    overflow-y: auto;
+    font: 12px/1.7 monospace;
+    overflow-wrap: anywhere;
+  }
+  button {
+    border: 1px solid #38516b;
+    border-radius: 7px;
+    padding: 9px 12px;
+    color: #e2e8f0;
+    background: #203449;
+    cursor: pointer;
+  }
+  button:hover { background: #2b4965; }
+  .toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 12px 16px;
+  }
+  @media (max-width: 750px) {
+    main { grid-template-columns: 1fr; }
+    .stats { grid-template-columns: repeat(3, 1fr); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>✈ ATC Control Tower</h1>
+    <div class="muted">MULTIPLAYER AIRSPACE SIMULATOR</div>
+  </div>
+  <div class="status">● SIMULATION ONLINE</div>
+</header>
+
+<main>
+  <section>
+    <div class="stats">
+      <div class="panel stat">
+        <div class="muted">Aircraft</div>
+        <div class="number" id="aircraftCount">0</div>
+      </div>
+      <div class="panel stat">
+        <div class="muted">Landings</div>
+        <div class="number" id="landingCount">0</div>
+      </div>
+      <div class="panel stat">
+        <div class="muted">Conflicts</div>
+        <div class="number" id="conflictCount">0</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">Live Radar</div>
+      <canvas id="radar" width="800" height="540"></canvas>
+      <div class="toolbar">
+        <span class="muted">SIMULATED AIRCRAFT</span>
+        <div>
+          <button id="spawn">+ Add aircraft</button>
+          <button id="pause">Pause</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <aside>
+    <div class="panel" style="margin-bottom:16px">
+      <div class="panel-title">Runway Status</div>
+      <div class="content">
+        <div class="runway">
+          <strong>RWY 09</strong>
+          <div class="muted" id="rwy09">Available</div>
+        </div>
+        <div class="runway">
+          <strong>RWY 27</strong>
+          <div class="muted" id="rwy27">Available</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">Tower Event Log</div>
+      <div class="content log" id="log"></div>
+    </div>
+  </aside>
+</main>
+
+<script>
+const canvas = document.getElementById("radar");
+const ctx = canvas.getContext("2d");
+const planes = [];
+let nextId = 1;
+let landings = 0;
+let paused = false;
+let lastTime = performance.now();
+
+function log(message) {
+  const line = document.createElement("div");
+  const time = new Date().toLocaleTimeString();
+  line.textContent = `[${time}] ${message}`;
+  document.getElementById("log").prepend(line);
+}
+
+function addPlane() {
+  const plane = {
+    id: nextId++,
+    x: 35 + Math.random() * 730,
+    y: 35 + Math.random() * 470,
+    vx: (Math.random() - 0.5) * 45,
+    vy: (Math.random() - 0.5) * 45,
+    color: "#ffffff"
+  };
+  planes.push(plane);
+  log(`Flight ${String(plane.id).padStart(3, "0")} entered airspace`);
+  updateStats();
+}
+
+function updateStats() {
+  document.getElementById("aircraftCount").textContent = planes.length;
+  document.getElementById("landingCount").textContent = landings;
+}
+
+function draw() {
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  // Radar grid
+  ctx.strokeStyle = "rgba(26, 95, 180, 0.3)";
+  ctx.lineWidth = 1;
+  for (let x = 0; x <= w; x += 50) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+  for (let y = 0; y <= h; y += 50) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+
+  // Airport and runway
+  ctx.fillStyle = "#1a5fb4";
+  ctx.fillRect(w / 2 - 65, h / 2 - 9, 130, 18);
+  ctx.strokeStyle = "#ffffff";
+  ctx.setLineDash([9, 7]);
+  ctx.beginPath();
+  ctx.moveTo(w / 2 - 60, h / 2);
+  ctx.lineTo(w / 2 + 60, h / 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "12px monospace";
+  ctx.fillText("AIRPORT", w / 2 - 28, h / 2 + 30);
+
+  // Aircraft markers
+  for (const p of planes) {
+    ctx.strokeStyle = p.color;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 15, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    ctx.lineTo(p.x - p.vx * 0.35, p.y - p.vy * 0.35);
+    ctx.stroke();
+
+    ctx.font = "12px monospace";
+    ctx.fillText("FLT-" + String(p.id).padStart(3, "0"),
+      p.x + 15, p.y - 9);
+  }
+
+  requestAnimationFrame(draw);
+}
+
+function animate(now) {
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+
+  if (!paused) {
+    for (const p of planes) {
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+
+      if (p.x < 15 || p.x > canvas.width - 15) p.vx *= -1;
+      if (p.y < 15 || p.y > canvas.height - 15) p.vy *= -1;
+
+      p.x = Math.max(15, Math.min(canvas.width - 15, p.x));
+      p.y = Math.max(15, Math.min(canvas.height - 15, p.y));
+    }
+  }
+
+  requestAnimationFrame(animate);
+}
+
+document.getElementById("spawn").addEventListener("click", addPlane);
+document.getElementById("pause").addEventListener("click", event => {
+  paused = !paused;
+  event.target.textContent = paused ? "Resume" : "Pause";
+  log(paused ? "Simulation paused" : "Simulation resumed");
+});
+
+addPlane();
+addPlane();
+addPlane();
+log("Tower simulation initialized");
+draw();
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>
