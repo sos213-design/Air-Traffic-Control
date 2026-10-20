@@ -1,0 +1,267 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ATC Pilot Cockpit</title>
+<style>
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: #0a1018;
+    color: #e2e8f0;
+    font-family: system-ui, sans-serif;
+  }
+
+  header {
+    padding: 20px;
+    background: #111c2a;
+    border-bottom: 1px solid #263548;
+  }
+
+  h1 { margin: 0; font-size: 23px; }
+  h2 { font-size: 16px; margin: 0 0 14px; }
+  p { margin: 6px 0; }
+  .muted { color: #8da2b9; font-size: 13px; }
+
+  main {
+    max-width: 600px;
+    margin: auto;
+    padding: 16px;
+    display: grid;
+    gap: 16px;
+  }
+
+  .panel {
+    background: #111c2a;
+    border: 1px solid #263548;
+    border-radius: 12px;
+    padding: 18px;
+  }
+
+  .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+  }
+
+  input, select {
+    width: 100%;
+    padding: 12px;
+    margin: 8px 0;
+    color: #e2e8f0;
+    background: #0a1522;
+    border: 1px solid #38516b;
+    border-radius: 8px;
+    font: inherit;
+  }
+
+  button {
+    padding: 13px;
+    border: 1px solid #38516b;
+    border-radius: 9px;
+    color: #e2e8f0;
+    background: #203449;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+
+  button:active { transform: scale(.98); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+
+  .signals {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .emergency {
+    background: #662b35;
+    border-color: #a94050;
+  }
+
+  .primary {
+    width: 100%;
+    background: #176348;
+    border-color: #268363;
+  }
+
+  .pill {
+    font-size: 12px;
+    padding: 5px 9px;
+    border-radius: 20px;
+    background: #263548;
+  }
+
+  .value { font-size: 23px; font-weight: 700; }
+  #log { font: 12px/1.8 monospace; overflow-wrap: anywhere; }
+  .log-line { border-bottom: 1px solid #263548; padding: 5px 0; }
+
+  @media (max-width: 360px) {
+    .signals { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <div>
+      <h1>✈ Pilot Cockpit</h1>
+      <p class="muted">AIR TRAFFIC CONTROL SIMULATOR</p>
+    </div>
+    <span class="pill" id="connection">DEMO MODE</span>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Flight Registration</h2>
+    <label for="callsign" class="muted">Choose your callsign</label>
+    <input id="callsign" maxlength="16" value="EAGLE-01"
+           placeholder="Example: EAGLE-01">
+
+    <label for="destination" class="muted">Destination</label>
+    <select id="destination">
+      <option value="TOWER">Main Airport</option>
+      <option value="NORTH">Northern Airport</option>
+      <option value="SOUTH">Southern Airport</option>
+    </select>
+
+    <button class="primary" id="register">Register Flight</button>
+  </section>
+
+  <section class="panel">
+    <div class="row">
+      <h2>Flight Status</h2>
+      <span class="pill" id="status">NOT REGISTERED</span>
+    </div>
+    <div class="row">
+      <div>
+        <p class="muted">CALLSIGN</p>
+        <div class="value" id="displayCallsign">---</div>
+      </div>
+      <div>
+        <p class="muted">DESTINATION</p>
+        <div id="displayDestination">---</div>
+      </div>
+    </div>
+    <p class="muted" id="instructions">
+      Register your flight to begin.
+    </p>
+  </section>
+
+  <section class="panel">
+    <h2>Transmit Signal</h2>
+    <div class="signals">
+      <button data-signal="LAND_REQUEST" disabled>
+        🛬 Request Landing
+      </button>
+      <button data-signal="ALT_UP" disabled>
+        ⬆ Request Higher Altitude
+      </button>
+      <button data-signal="ROUTE_CHANGE" disabled>
+        🧭 Request Route Change
+      </button>
+      <button data-signal="HOLD" disabled>
+        ⏸ Enter Holding Pattern
+      </button>
+      <button class="emergency" data-signal="MAYDAY" disabled>
+        ⚠ Declare Emergency
+      </button>
+      <button data-signal="STATUS_REQUEST" disabled>
+        📡 Request Status
+      </button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Custom Signal</h2>
+    <p class="muted">
+      Send a custom signal name to test the protocol.
+      The tower will decide whether it is valid.
+    </p>
+    <input id="customSignal" maxlength="32"
+           placeholder="Example: WEATHER_REQUEST">
+    <button id="sendCustom" disabled>Transmit Custom Signal</button>
+  </section>
+
+  <section class="panel">
+    <h2>Radio Log</h2>
+    <div id="log" aria-live="polite">
+      <div class="log-line">Cockpit initialized.</div>
+      <div class="log-line">Waiting for pilot registration.</div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+let registered = false;
+
+function log(message) {
+  const line = document.createElement("div");
+  line.className = "log-line";
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+  $("log").prepend(line);
+}
+
+function setRegistered(value) {
+  registered = value;
+
+  document.querySelectorAll("[data-signal]").forEach(button => {
+    button.disabled = !value;
+  });
+
+  $("sendCustom").disabled = !value;
+  $("status").textContent = value ? "REGISTERED" : "NOT REGISTERED";
+}
+
+$("register").addEventListener("click", () => {
+  const callsign = $("callsign").value.trim();
+  const destination = $("destination").value;
+
+  if (!/^[A-Za-z0-9-]{1,16}$/.test(callsign)) {
+    log("Invalid callsign. Use letters, numbers, or hyphens.");
+    return;
+  }
+
+  $("displayCallsign").textContent = callsign.toUpperCase();
+  $("displayDestination").textContent = destination;
+  $("instructions").textContent =
+    "Flight registered locally. Server connection is not implemented yet.";
+
+  setRegistered(true);
+  log(`Demo registration: ${callsign.toUpperCase()} → ${destination}`);
+});
+
+function transmit(signal) {
+  if (!registered) return;
+
+  // Temporary demo behavior: this does not contact the server.
+  log(`DEMO SIGNAL: ${signal}`);
+}
+
+document.querySelectorAll("[data-signal]").forEach(button => {
+  button.addEventListener("click", () => transmit(button.dataset.signal));
+});
+
+$("sendCustom").addEventListener("click", () => {
+  const signal = $("customSignal").value.trim().toUpperCase();
+
+  if (!/^[A-Z][A-Z0-9_]{0,31}$/.test(signal)) {
+    log("Invalid signal format.");
+    return;
+  }
+
+  transmit(signal);
+  $("customSignal").value = "";
+});
+</script>
+</body>
+</html>
