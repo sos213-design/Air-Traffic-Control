@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+import math
 import random
 import re
 import socket
@@ -23,23 +24,46 @@ TICK = 0.1
 INITIAL_PLANES = 3
 
 CALLSIGN_PATTERN = re.compile(r"^[A-Z0-9-]{1,16}$")
-DESTINATIONS = {"TOWER", "NORTH", "SOUTH"}
 
-# Cockpit signal -> (new plane status, tower reply)
-PILOT_SIGNALS = {
-    "LAND_REQUEST": ("LAND_REQUESTED", "landing request received, expect approach clearance."),
-    "ALT_UP": ("CLIMB_REQUESTED", "climb request received, stand by."),
-    "ROUTE_CHANGE": ("ROUTE_CHANGE_REQUESTED", "route change request received, stand by."),
-    "HOLD": ("HOLDING", "roger, enter holding pattern."),
-    "MAYDAY": ("MAYDAY", "emergency acknowledged, all traffic stand by."),
+# Flight model
+PX_PER_NM = 10            # radar pixels per nautical mile
+CLIMB_STEP = 2000         # feet gained per "Request Higher Altitude"
+CLIMB_RATE = 500          # feet per second
+MAX_ALTITUDE = 40000
+HOLD_RADIUS = 30          # px
+APPROACH_SPEED = 30       # px per second
+
+# Destination code (as sent by the cockpit) -> airport. Each has one runway.
+airports = {
+    "TOWER": {"code": "TOWER", "name": "Main Airport", "runway": "RWY 09", "x": 400, "y": 270},
+    "NORTH": {"code": "NORTH", "name": "Northern Airport", "runway": "RWY 18", "x": 400, "y": 70},
+    "SOUTH": {"code": "SOUTH", "name": "Southern Airport", "runway": "RWY 36", "x": 400, "y": 470},
 }
+for airport in airports.values():
+    airport["occupant"] = None   # plane id cleared to land
+    airport["queue"] = []        # plane ids waiting for clearance, in order
 
 planes = {}
-clients = set()
+holds = {}        # plane id -> {"cx", "cy", "angle"} while circling
+pilots = {}       # plane id -> cockpit websocket
+clients = set()   # radar websockets
+send_locks = {}
 next_id = 1
 paused = False
 landings = 0
 state_lock = asyncio.Lock()
+
+
+def heading_Of(vx, vy):
+    """Compass heading in degrees: 0 is up (north), 90 is right (east)."""
+    return round(math.degrees(math.atan2(vx, -vy))) % 360
+
+
+def set_Heading(plane, heading, speed=None):
+    speed = speed if speed is not None else math.hypot(plane["vx"], plane["vy"])
+    plane["vx"] = math.sin(math.radians(heading)) * speed
+    plane["vy"] = -math.cos(math.radians(heading)) * speed
+    plane["heading"] = heading % 360
 
 
 def create_Plane(callsign=None, destination="TOWER"):
@@ -54,21 +78,75 @@ def create_Plane(callsign=None, destination="TOWER"):
         "destination": destination,
         "x": 35 + random.random() * 730,
         "y": 35 + random.random() * 470,
-        "vx": (random.random() - 0.5) * 45,
-        "vy": (random.random() - 0.5) * 45,
+        "vx": 0,
+        "vy": 0,
+        "heading": 0,
+        "altitude": random.randint(6, 15) * 1000,
+        "target_altitude": 0,
         "status": "AIRBORNE",
+        "emergency": False,
     }
+    plane["target_altitude"] = plane["altitude"]
+    set_Heading(plane, random.randint(0, 359), 15 + random.random() * 15)
     planes[plane_id] = plane
     return plane
+
+
+def leave_Sequence(plane):
+    """Drop a plane's landing clearance or place in line, if it has one."""
+    airport = airports[plane["destination"]]
+    if airport["occupant"] == plane["id"]:
+        airport["occupant"] = None
+    if plane["id"] in airport["queue"]:
+        airport["queue"].remove(plane["id"])
+
+
+def remove_Plane(plane_id):
+    if plane_id in planes:
+        leave_Sequence(planes.pop(plane_id))
+    holds.pop(plane_id, None)
+
+
+def callsign_Of(plane_id):
+    return planes[plane_id]["callsign"] if plane_id in planes else None
 
 
 def state_Message():
     return json.dumps({
         "type": "state",
         "planes": list(planes.values()),
+        "airports": [
+            {
+                "code": a["code"],
+                "name": a["name"],
+                "runway": a["runway"],
+                "x": a["x"],
+                "y": a["y"],
+                "occupant": callsign_Of(a["occupant"]),
+                "queue": [callsign_Of(pid) for pid in a["queue"]],
+            }
+            for a in airports.values()
+        ],
         "paused": paused,
         "landings": landings,
     })
+
+
+def flight_Message(plane_id):
+    plane = planes[plane_id]
+    queue = airports[plane["destination"]]["queue"]
+    return {
+        "type": "flight",
+        "plane": plane,
+        "queue_position": queue.index(plane_id) + 1 if plane_id in queue else None,
+    }
+
+
+async def send_Text(websocket, text):
+    # Radar broadcasts and replies can overlap; send one message at a time.
+    lock = send_locks.setdefault(websocket, asyncio.Lock())
+    async with lock:
+        await websocket.send_text(text)
 
 
 async def broadcast_State():
@@ -79,32 +157,161 @@ async def broadcast_State():
 
     for client in list(clients):
         try:
-            await client.send_text(message)
+            await send_Text(client, message)
         except Exception:
             disconnected.add(client)
 
     clients.difference_update(disconnected)
 
 
+async def send_To_Pilots(messages):
+    for plane_id, message in messages:
+        websocket = pilots.get(plane_id)
+        if websocket is None:
+            continue
+        try:
+            await send_Text(websocket, json.dumps(message))
+        except Exception:
+            pass  # the cockpit's own handler cleans up on disconnect
+
+
+def start_Hold(plane):
+    """Circle to the right of the current track, starting where the plane is."""
+    speed = max(math.hypot(plane["vx"], plane["vy"]), 15)
+    right = math.radians(plane["heading"] + 90)
+    cx = plane["x"] + math.sin(right) * HOLD_RADIUS
+    cy = plane["y"] - math.cos(right) * HOLD_RADIUS
+    cx = max(MIN_X + HOLD_RADIUS, min(MAX_X - HOLD_RADIUS, cx))
+    cy = max(MIN_Y + HOLD_RADIUS, min(MAX_Y - HOLD_RADIUS, cy))
+    holds[plane["id"]] = {
+        "cx": cx,
+        "cy": cy,
+        "angle": math.atan2(plane["y"] - cy, plane["x"] - cx),
+        "speed": speed,
+    }
+
+
+def leave_Hold(plane):
+    holds.pop(plane["id"], None)
+    plane["status"] = "AIRBORNE"
+
+
+def clear_To_Land(plane_id, airport):
+    plane = planes[plane_id]
+    airport["occupant"] = plane_id
+    holds.pop(plane_id, None)
+    plane["status"] = "APPROACH"
+    return (
+        f"{plane['callsign']}, cleared to land {airport['runway']} "
+        f"at {airport['name']}."
+    )
+
+
+def enqueue(plane_id, airport):
+    """Emergencies go ahead of everyone except earlier emergencies."""
+    queue = airport["queue"]
+    if plane_id in queue:
+        queue.remove(plane_id)
+
+    position = len(queue)
+    if planes[plane_id]["emergency"]:
+        position = sum(1 for pid in queue if planes[pid]["emergency"])
+    queue.insert(position, plane_id)
+    return position + 1
+
+
+def step_Plane(plane, events):
+    """Advance one plane by one tick. Returns True if it landed."""
+    global landings
+
+    plane_id = plane["id"]
+
+    if plane["status"] == "APPROACH":
+        airport = airports[plane["destination"]]
+        dx, dy = airport["x"] - plane["x"], airport["y"] - plane["y"]
+        distance = math.hypot(dx, dy)
+
+        if distance <= APPROACH_SPEED * TICK:
+            landings += 1
+            events.append((plane_id, {
+                "type": "landed",
+                "message": (
+                    f"{plane['callsign']}, welcome to {airport['name']}. "
+                    "Taxi to the gate."
+                ),
+            }))
+            return True
+
+        set_Heading(plane, heading_Of(dx, dy), APPROACH_SPEED)
+        plane["x"] += plane["vx"] * TICK
+        plane["y"] += plane["vy"] * TICK
+        # Descend evenly so the plane reaches the ground at the runway.
+        plane["altitude"] *= (distance - APPROACH_SPEED * TICK) / distance
+        plane["target_altitude"] = plane["altitude"]
+        return False
+
+    if plane_id in holds:
+        hold = holds[plane_id]
+        hold["angle"] += hold["speed"] / HOLD_RADIUS * TICK
+        plane["x"] = hold["cx"] + math.cos(hold["angle"]) * HOLD_RADIUS
+        plane["y"] = hold["cy"] + math.sin(hold["angle"]) * HOLD_RADIUS
+        # Velocity along the circle, so radars can extrapolate smoothly.
+        plane["vx"] = -math.sin(hold["angle"]) * hold["speed"]
+        plane["vy"] = math.cos(hold["angle"]) * hold["speed"]
+        plane["heading"] = heading_Of(plane["vx"], plane["vy"])
+    else:
+        plane["x"] += plane["vx"] * TICK
+        plane["y"] += plane["vy"] * TICK
+
+        if plane["x"] < MIN_X or plane["x"] > MAX_X:
+            plane["vx"] *= -1
+        if plane["y"] < MIN_Y or plane["y"] > MAX_Y:
+            plane["vy"] *= -1
+
+        plane["x"] = max(MIN_X, min(MAX_X, plane["x"]))
+        plane["y"] = max(MIN_Y, min(MAX_Y, plane["y"]))
+        plane["heading"] = heading_Of(plane["vx"], plane["vy"])
+
+    if plane["altitude"] < plane["target_altitude"]:
+        plane["altitude"] = min(
+            plane["target_altitude"],
+            plane["altitude"] + CLIMB_RATE * TICK,
+        )
+        if plane["altitude"] == plane["target_altitude"]:
+            events.append((plane_id, {
+                "type": "ack",
+                "message": (
+                    f"{plane['callsign']}, reaching {plane['altitude']:,.0f} feet, "
+                    "maintain."
+                ),
+            }))
+    return False
+
+
 async def simulation_Loop():
     while True:
         await asyncio.sleep(TICK)
+        events = []
 
         async with state_lock:
             if not paused:
-                for plane in planes.values():
-                    plane["x"] += plane["vx"] * TICK
-                    plane["y"] += plane["vy"] * TICK
+                for plane in list(planes.values()):
+                    if step_Plane(plane, events):
+                        remove_Plane(plane["id"])
 
-                    if plane["x"] < MIN_X or plane["x"] > MAX_X:
-                        plane["vx"] *= -1
-                    if plane["y"] < MIN_Y or plane["y"] > MAX_Y:
-                        plane["vy"] *= -1
+                # Clear the next plane in line onto any runway that is free.
+                for airport in airports.values():
+                    if airport["occupant"] is None and airport["queue"]:
+                        plane_id = airport["queue"].pop(0)
+                        events.append((plane_id, {
+                            "type": "ack",
+                            "message": clear_To_Land(plane_id, airport),
+                        }))
 
-                    plane["x"] = max(MIN_X, min(MAX_X, plane["x"]))
-                    plane["y"] = max(MIN_Y, min(MAX_Y, plane["y"]))
+            updates = [(pid, flight_Message(pid)) for pid in pilots if pid in planes]
 
         await broadcast_State()
+        await send_To_Pilots(events + updates)
 
 
 @asynccontextmanager
@@ -188,10 +395,10 @@ async def read_Signal(websocket: WebSocket):
         if isinstance(signal, dict):
             return signal
 
-        await websocket.send_json({
+        await send_Text(websocket, json.dumps({
             "type": "error",
             "message": "JSON decoding error",
-        })
+        }))
 
 
 @app.websocket("/ws/tower")
@@ -203,7 +410,7 @@ async def tower_websocket(websocket: WebSocket):
 
     async with state_lock:
         snapshot = state_Message()
-    await websocket.send_text(snapshot)
+    await send_Text(websocket, snapshot)
     clients.add(websocket)
 
     try:
@@ -221,6 +428,116 @@ async def tower_websocket(websocket: WebSocket):
         pass
     finally:
         clients.discard(websocket)
+        send_locks.pop(websocket, None)
+
+
+def request_Landing(plane):
+    airport = airports[plane["destination"]]
+
+    if plane["status"] == "APPROACH":
+        return f"{plane['callsign']}, you are already cleared to land, continue approach."
+    if plane["id"] in airport["queue"]:
+        position = airport["queue"].index(plane["id"]) + 1
+        return f"{plane['callsign']}, you are number {position} for landing, continue holding."
+
+    if airport["occupant"] is None and not airport["queue"]:
+        return clear_To_Land(plane["id"], airport)
+
+    position = enqueue(plane["id"], airport)
+    if plane["id"] not in holds:
+        start_Hold(plane)
+    plane["status"] = "AWAITING_CLEARANCE"
+    return (
+        f"{plane['callsign']}, {airport['runway']} is occupied. Hold, you are "
+        f"number {position} for landing at {airport['name']}."
+    )
+
+
+def request_Climb(plane):
+    if plane["status"] == "APPROACH":
+        return f"{plane['callsign']}, unable, you are on approach. Maintain glide path."
+    if plane["target_altitude"] >= MAX_ALTITUDE:
+        return f"{plane['callsign']}, unable, {MAX_ALTITUDE:,} feet is the ceiling."
+
+    plane["target_altitude"] = min(MAX_ALTITUDE, plane["target_altitude"] + CLIMB_STEP)
+    return (
+        f"{plane['callsign']}, climb and maintain "
+        f"{plane['target_altitude']:,.0f} feet."
+    )
+
+
+def request_Route_Change(plane):
+    if plane["status"] == "APPROACH":
+        return f"{plane['callsign']}, unable, you are cleared to land. Continue approach."
+    if plane["status"] == "AWAITING_CLEARANCE":
+        return f"{plane['callsign']}, unable, hold until cleared to land."
+
+    if plane["id"] in holds:
+        leave_Hold(plane)
+
+    turn = random.choice([-1, 1]) * random.randint(45, 135)
+    new_heading = (plane["heading"] + turn) % 360
+    set_Heading(plane, new_heading)
+    direction = "right" if turn > 0 else "left"
+    return f"{plane['callsign']}, turn {direction} heading {new_heading:03d}."
+
+
+def toggle_Hold(plane):
+    callsign = plane["callsign"]
+    airport = airports[plane["destination"]]
+
+    if plane["status"] == "HOLDING":
+        leave_Hold(plane)
+        return f"{callsign}, leave the hold, resume own navigation heading {plane['heading']:03d}."
+
+    if plane["status"] == "AWAITING_CLEARANCE":
+        leave_Sequence(plane)
+        plane["status"] = "HOLDING"
+        return f"{callsign}, landing request cancelled. Continue holding."
+
+    if plane["status"] == "APPROACH":
+        leave_Sequence(plane)
+        start_Hold(plane)
+        plane["status"] = "HOLDING"
+        return f"{callsign}, approach cancelled, {airport['runway']} released. Enter the hold."
+
+    start_Hold(plane)
+    plane["status"] = "HOLDING"
+    return f"{callsign}, enter holding pattern as published."
+
+
+def toggle_Emergency(plane):
+    callsign = plane["callsign"]
+    plane["emergency"] = not plane["emergency"]
+
+    if not plane["emergency"]:
+        return f"{callsign}, emergency cancelled. Resume normal operations."
+
+    airport = airports[plane["destination"]]
+    if plane["id"] in airport["queue"]:
+        position = enqueue(plane["id"], airport)
+        return (
+            f"{callsign}, MAYDAY acknowledged. You have priority, "
+            f"now number {position} for landing."
+        )
+    return (
+        f"{callsign}, MAYDAY acknowledged. All traffic stand by. "
+        "Request landing when ready, you have priority."
+    )
+
+
+def status_Report(plane):
+    airport = airports[plane["destination"]]
+    distance = math.hypot(airport["x"] - plane["x"], airport["y"] - plane["y"]) / PX_PER_NM
+    bearing = heading_Of(airport["x"] - plane["x"], airport["y"] - plane["y"])
+    speed = math.hypot(plane["vx"], plane["vy"]) * 10
+    return (
+        f"{plane['callsign']}, radar contact. Altitude {plane['altitude']:,.0f} feet, "
+        f"heading {plane['heading']:03d}, {speed:.0f} knots. {airport['name']} "
+        f"bears {bearing:03d}, {distance:.0f} miles. Status "
+        f"{plane['status'].replace('_', ' ').lower()}"
+        f"{', emergency declared' if plane['emergency'] else ''}."
+    )
 
 
 async def handle_Pilot_Signal(plane_id, signal_type):
@@ -229,36 +546,34 @@ async def handle_Pilot_Signal(plane_id, signal_type):
         if plane is None:
             return {"type": "error", "message": "Register your flight first."}
 
-        if signal_type == "STATUS_REQUEST":
+        if signal_type == "LAND_REQUEST":
+            message = request_Landing(plane)
+        elif signal_type == "ALT_UP":
+            message = request_Climb(plane)
+        elif signal_type == "ROUTE_CHANGE":
+            message = request_Route_Change(plane)
+        elif signal_type == "HOLD":
+            message = toggle_Hold(plane)
+        elif signal_type == "MAYDAY":
+            message = toggle_Emergency(plane)
+        elif signal_type == "STATUS_REQUEST":
+            message = status_Report(plane)
+        else:
             return {
-                "type": "ack",
-                "signal": signal_type,
-                "message": (
-                    f"{plane['callsign']}, radar contact at "
-                    f"({plane['x']:.0f}, {plane['y']:.0f}), status {plane['status']}."
-                ),
+                "type": "error",
+                "message": f"Tower does not recognise signal {signal_type}.",
             }
 
-        if signal_type in PILOT_SIGNALS:
-            status, reply = PILOT_SIGNALS[signal_type]
-            plane["status"] = status
-            return {
-                "type": "ack",
-                "signal": signal_type,
-                "status": status,
-                "message": f"{plane['callsign']}, {reply}",
-            }
-
-    return {"type": "error", "message": f"Tower does not recognise signal {signal_type}."}
+        return {"type": "ack", "signal": signal_type, "message": message}
 
 
-async def register_Pilot(plane_id, signal):
+async def register_Pilot(websocket, plane_id, signal):
     callsign = str(signal.get("callsign", "")).strip().upper()
     destination = str(signal.get("destination", "TOWER")).upper()
 
     if not CALLSIGN_PATTERN.match(callsign):
         return plane_id, {"type": "error", "message": "Invalid callsign."}
-    if destination not in DESTINATIONS:
+    if destination not in airports:
         return plane_id, {"type": "error", "message": "Unknown destination."}
 
     async with state_lock:
@@ -270,16 +585,25 @@ async def register_Pilot(plane_id, signal):
             return plane_id, {"type": "error", "message": f"Callsign {callsign} is already in use."}
 
         if plane_id in planes:
-            planes[plane_id]["callsign"] = callsign
-            planes[plane_id]["destination"] = destination
+            plane = planes[plane_id]
+            if destination != plane["destination"]:
+                # A new destination means a new landing sequence.
+                if plane["status"] in ("APPROACH", "AWAITING_CLEARANCE"):
+                    leave_Sequence(plane)
+                    holds.pop(plane_id, None)
+                    plane["status"] = "AIRBORNE"
+                plane["destination"] = destination
+            plane["callsign"] = callsign
         else:
+            pilots.pop(plane_id, None)
             plane_id = create_Plane(callsign, destination)["id"]
+            pilots[plane_id] = websocket
 
     return plane_id, {
         "type": "registered",
         "callsign": callsign,
         "destination": destination,
-        "message": f"{callsign}, radar contact. Cleared to {destination}.",
+        "message": f"{callsign}, radar contact. Cleared to {airports[destination]['name']}.",
     }
 
 
@@ -294,16 +618,18 @@ async def websocket_endpoint(websocket: WebSocket):
             signal = await read_Signal(websocket)
 
             if signal.get("type") == "REGISTER":
-                plane_id, reply = await register_Pilot(plane_id, signal)
+                plane_id, reply = await register_Pilot(websocket, plane_id, signal)
             else:
                 reply = await handle_Pilot_Signal(plane_id, str(signal.get("type")))
 
-            await websocket.send_json(reply)
+            await send_Text(websocket, json.dumps(reply))
     except WebSocketDisconnect:
         pass
     finally:
         async with state_lock:
-            planes.pop(plane_id, None)
+            pilots.pop(plane_id, None)
+            remove_Plane(plane_id)
+        send_locks.pop(websocket, None)
 
 
 if __name__ == "__main__":

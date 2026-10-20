@@ -151,6 +151,16 @@
         <div id="displayDestination">---</div>
       </div>
     </div>
+    <div class="row">
+      <div>
+        <p class="muted">ALTITUDE</p>
+        <div class="value" id="displayAltitude">---</div>
+      </div>
+      <div>
+        <p class="muted">HEADING</p>
+        <div id="displayHeading">---</div>
+      </div>
+    </div>
     <p class="muted" id="instructions">
       Register your flight to begin.
     </p>
@@ -206,6 +216,22 @@ const $ = id => document.getElementById(id);
 let registered = false;
 let socket = null;
 
+const AIRPORT_NAMES = {
+  TOWER: "Main Airport",
+  NORTH: "Northern Airport",
+  SOUTH: "Southern Airport",
+};
+
+const STATUS_TEXT = {
+  AIRBORNE: "Cruising. Transmit a signal to the tower.",
+  HOLDING: "Circling in the holding pattern.",
+  AWAITING_CLEARANCE: "Holding until the runway is free.",
+  APPROACH: "Cleared to land. Descending toward the runway.",
+};
+
+const holdButton = document.querySelector('[data-signal="HOLD"]');
+const maydayButton = document.querySelector('[data-signal="MAYDAY"]');
+
 function log(message) {
   const line = document.createElement("div");
   line.className = "log-line";
@@ -228,6 +254,42 @@ function setRegistered(value) {
   $("sendCustom").disabled = !value;
   $("status").textContent = value ? "REGISTERED" : "NOT REGISTERED";
   $("register").textContent = value ? "Update Flight" : "Register Flight";
+  $("status").style.background = "";
+
+  if (!value) {
+    $("displayAltitude").textContent = "---";
+    $("displayHeading").textContent = "---";
+    holdButton.textContent = "⏸ Enter Holding Pattern";
+    maydayButton.textContent = "⚠ Declare Emergency";
+  }
+}
+
+// Live flight data, sent by the server every tick.
+function showFlight(plane, queuePosition) {
+  $("displayCallsign").textContent = plane.callsign;
+  $("displayDestination").textContent = AIRPORT_NAMES[plane.destination] || plane.destination;
+
+  const climbing = plane.altitude < plane.target_altitude;
+  $("displayAltitude").textContent =
+    `${Math.round(plane.altitude).toLocaleString()} ft${climbing ? " ↑" : ""}`;
+  $("displayHeading").textContent = String(plane.heading).padStart(3, "0") + "°";
+
+  $("status").textContent = plane.emergency
+    ? "MAYDAY"
+    : plane.status.replace(/_/g, " ");
+  $("status").style.background = plane.emergency ? "#a94050" : "";
+
+  let instructions = STATUS_TEXT[plane.status] || "";
+  if (queuePosition) instructions += ` You are number ${queuePosition} for landing.`;
+  if (climbing) instructions += ` Climbing to ${plane.target_altitude.toLocaleString()} ft.`;
+  $("instructions").textContent = instructions;
+
+  holdButton.textContent = plane.status === "HOLDING"
+    ? "▶ Leave Holding Pattern"
+    : "⏸ Enter Holding Pattern";
+  maydayButton.textContent = plane.emergency
+    ? "✔ Cancel Emergency"
+    : "⚠ Declare Emergency";
 }
 
 function send(message) {
@@ -242,13 +304,20 @@ function send(message) {
 function handleMessage(message) {
   if (message.type === "registered") {
     $("displayCallsign").textContent = message.callsign;
-    $("displayDestination").textContent = message.destination;
+    $("displayDestination").textContent = AIRPORT_NAMES[message.destination] || message.destination;
     $("instructions").textContent =
       "Your aircraft is on the tower radar. Transmit signals below.";
     setRegistered(true);
     log(`TOWER: ${message.message}`);
+  } else if (message.type === "flight") {
+    if (registered) showFlight(message.plane, message.queue_position);
+  } else if (message.type === "landed") {
+    setRegistered(false);
+    $("status").textContent = "LANDED";
+    $("register").textContent = "Take Off Again";
+    $("instructions").textContent = "You have landed. Register again to take off.";
+    log(`TOWER: ${message.message}`);
   } else if (message.type === "ack") {
-    if (message.status) $("status").textContent = message.status.replace(/_/g, " ");
     log(`TOWER: ${message.message}`);
   } else if (message.type === "error") {
     log(`TOWER: ${message.message}`);

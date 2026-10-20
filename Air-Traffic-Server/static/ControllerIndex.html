@@ -134,16 +134,7 @@
   <aside>
     <div class="panel" style="margin-bottom:16px">
       <div class="panel-title">Runway Status</div>
-      <div class="content">
-        <div class="runway">
-          <strong>RWY 09</strong>
-          <div class="muted" id="rwy09">Available</div>
-        </div>
-        <div class="runway">
-          <strong>RWY 27</strong>
-          <div class="muted" id="rwy27">Available</div>
-        </div>
-      </div>
+      <div class="content" id="runways"></div>
     </div>
 
     <div class="panel">
@@ -162,6 +153,7 @@ const pauseButton = document.getElementById("pause");
 // Shared airspace state, owned by the Python server. Every radar connected
 // to the same server receives the same planes.
 let planes = [];
+let airports = [];
 let landings = 0;
 let paused = false;
 let socket = null;
@@ -169,12 +161,11 @@ let lastTime = performance.now();
 
 // Pilot requests from cockpit devices are highlighted on the radar.
 const STATUS_COLORS = {
-  LAND_REQUESTED: "#f6d32d",
-  CLIMB_REQUESTED: "#8ff0a4",
-  ROUTE_CHANGE_REQUESTED: "#99c1f1",
+  AWAITING_CLEARANCE: "#f6d32d",
+  APPROACH: "#8ff0a4",
   HOLDING: "#ffa348",
-  MAYDAY: "#ff4d5e",
 };
+const EMERGENCY_COLOR = "#ff4d5e";
 
 function log(message) {
   const line = document.createElement("div");
@@ -205,10 +196,22 @@ function applyState(state) {
     if (!old) log(`Flight ${p.callsign} entered airspace → ${p.destination}`);
     else if (p.callsign !== old.callsign) log(`Flight ${old.callsign} is now ${p.callsign}`);
     else if (p.status !== old.status) log(`Flight ${p.callsign} ${p.status.replace(/_/g, " ")}`);
+    if (old && p.emergency !== old.emergency) {
+      log(p.emergency ? `⚠ MAYDAY declared by ${p.callsign}` : `Flight ${p.callsign} cancelled emergency`);
+    }
+    if (old && p.target_altitude > old.target_altitude) {
+      log(`Flight ${p.callsign} climbing to ${p.target_altitude.toLocaleString()} ft`);
+    }
   }
   for (const p of planes) {
-    if (!current.has(p.id)) log(`Flight ${p.callsign} left airspace`);
+    if (current.has(p.id)) continue;
+    const airport = airports.find(a => a.code === p.destination);
+    if (p.status === "APPROACH" && airport) log(`Flight ${p.callsign} landed at ${airport.name}`);
+    else log(`Flight ${p.callsign} left airspace`);
   }
+
+  airports = state.airports;
+  renderRunways();
 
   if (state.paused !== paused) {
     log(state.paused ? "Simulation paused" : "Simulation resumed");
@@ -243,6 +246,27 @@ function connect() {
   });
 }
 
+function renderRunways() {
+  const container = document.getElementById("runways");
+  container.replaceChildren(...airports.map(a => {
+    const card = document.createElement("div");
+    card.className = "runway";
+    const title = document.createElement("strong");
+    title.textContent = `${a.runway} · ${a.name}`;
+    const status = document.createElement("div");
+    status.className = "muted";
+    status.textContent = a.occupant ? `Occupied: ${a.occupant} landing` : "Available";
+    card.append(title, status);
+    if (a.queue.length) {
+      const queue = document.createElement("div");
+      queue.className = "muted";
+      queue.textContent = `Holding for landing: ${a.queue.join(", ")}`;
+      card.append(queue);
+    }
+    return card;
+  }));
+}
+
 function updateStats() {
   document.getElementById("aircraftCount").textContent = planes.length;
   document.getElementById("landingCount").textContent = landings;
@@ -263,23 +287,30 @@ function draw() {
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
   }
 
-  // Airport and runway
-  ctx.fillStyle = "#1a5fb4";
-  ctx.fillRect(w / 2 - 65, h / 2 - 9, 130, 18);
-  ctx.strokeStyle = "#ffffff";
-  ctx.setLineDash([9, 7]);
-  ctx.beginPath();
-  ctx.moveTo(w / 2 - 60, h / 2);
-  ctx.lineTo(w / 2 + 60, h / 2);
-  ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.fillStyle = "#ffffff";
-  ctx.font = "12px monospace";
-  ctx.fillText("AIRPORT", w / 2 - 28, h / 2 + 30);
+  // Airports and runways. RWY 09 runs east-west; RWY 18 and 36 north-south.
+  for (const a of airports) {
+    const horizontal = a.runway === "RWY 09";
+    const len = horizontal ? 130 : 70;
+    ctx.fillStyle = a.occupant ? "#26a269" : "#1a5fb4";
+    if (horizontal) ctx.fillRect(a.x - len / 2, a.y - 9, len, 18);
+    else ctx.fillRect(a.x - 7, a.y - len / 2, 14, len);
+    ctx.strokeStyle = "#ffffff";
+    ctx.setLineDash([9, 7]);
+    ctx.beginPath();
+    if (horizontal) { ctx.moveTo(a.x - len / 2 + 5, a.y); ctx.lineTo(a.x + len / 2 - 5, a.y); }
+    else { ctx.moveTo(a.x, a.y - len / 2 + 5); ctx.lineTo(a.x, a.y + len / 2 - 5); }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "12px monospace";
+    const label = a.name.toUpperCase();
+    if (horizontal) ctx.fillText(label, a.x - ctx.measureText(label).width / 2, a.y + 30);
+    else ctx.fillText(label, a.x + 14, a.y + 4);
+  }
 
   // Aircraft markers
   for (const p of planes) {
-    const color = STATUS_COLORS[p.status] || "#ffffff";
+    const color = p.emergency ? EMERGENCY_COLOR : STATUS_COLORS[p.status] || "#ffffff";
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
     ctx.beginPath();
@@ -296,6 +327,10 @@ function draw() {
 
     ctx.font = "12px monospace";
     ctx.fillText(p.callsign, p.x + 15, p.y - 9);
+    const climbing = p.altitude < p.target_altitude;
+    const flightLevel = String(Math.round(p.altitude / 100)).padStart(3, "0");
+    ctx.fillText(`FL${flightLevel}${climbing ? "↑" : p.status === "APPROACH" ? "↓" : ""}`,
+      p.x + 15, p.y + 5);
   }
 
   requestAnimationFrame(draw);
