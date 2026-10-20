@@ -97,7 +97,7 @@
     <h1>✈ ATC Control Tower</h1>
     <div class="muted">MULTIPLAYER AIRSPACE SIMULATOR</div>
   </div>
-  <div class="status">● SIMULATION ONLINE</div>
+  <div class="status" id="connectionStatus">● CONNECTING…</div>
 </header>
 
 <main>
@@ -155,10 +155,15 @@
 <script>
 const canvas = document.getElementById("radar");
 const ctx = canvas.getContext("2d");
-const planes = [];
-let nextId = 1;
+const statusEl = document.getElementById("connectionStatus");
+const pauseButton = document.getElementById("pause");
+
+// Shared airspace state, owned by the Python server. Every radar connected
+// to the same server receives the same planes.
+let planes = [];
 let landings = 0;
 let paused = false;
+let socket = null;
 let lastTime = performance.now();
 
 function log(message) {
@@ -168,18 +173,62 @@ function log(message) {
   document.getElementById("log").prepend(line);
 }
 
-function addPlane() {
-  const plane = {
-    id: nextId++,
-    x: 35 + Math.random() * 730,
-    y: 35 + Math.random() * 470,
-    vx: (Math.random() - 0.5) * 45,
-    vy: (Math.random() - 0.5) * 45,
-    color: "#ffffff"
-  };
-  planes.push(plane);
-  log(`Flight ${String(plane.id).padStart(3, "0")} entered airspace`);
+function setStatus(online) {
+  statusEl.textContent = online ? "● SIMULATION ONLINE" : "● CONNECTING…";
+  statusEl.style.color = online ? "#1a5fb4" : "#e5a50a";
+}
+
+function send(type) {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type }));
+  } else {
+    log("Not connected to server");
+  }
+}
+
+function applyState(state) {
+  const previous = new Map(planes.map(p => [p.id, p]));
+  const current = new Set(state.planes.map(p => p.id));
+
+  for (const p of state.planes) {
+    if (!previous.has(p.id)) log(`Flight ${p.callsign} entered airspace`);
+    else if (p.status !== previous.get(p.id).status) log(`Flight ${p.callsign} ${p.status}`);
+  }
+  for (const p of planes) {
+    if (!current.has(p.id)) log(`Flight ${p.callsign} left airspace`);
+  }
+
+  if (state.paused !== paused) {
+    log(state.paused ? "Simulation paused" : "Simulation resumed");
+  }
+
+  planes = state.planes;
+  landings = state.landings;
+  paused = state.paused;
+  pauseButton.textContent = paused ? "Resume" : "Pause";
   updateStats();
+}
+
+function connect() {
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  socket = new WebSocket(`${protocol}://${location.host}/ws/tower`);
+
+  socket.addEventListener("open", () => {
+    setStatus(true);
+    log("Connected to tower server");
+  });
+
+  socket.addEventListener("message", event => {
+    const message = JSON.parse(event.data);
+    if (message.type === "state") applyState(message);
+    else if (message.type === "error") log(`Server error: ${message.message}`);
+  });
+
+  socket.addEventListener("close", () => {
+    setStatus(false);
+    log("Lost connection to server, retrying…");
+    setTimeout(connect, 2000);
+  });
 }
 
 function updateStats() {
@@ -218,8 +267,9 @@ function draw() {
 
   // Aircraft markers
   for (const p of planes) {
-    ctx.strokeStyle = p.color;
-    ctx.fillStyle = p.color;
+    const color = p.status === "LAND_REQUESTED" ? "#f6d32d" : "#ffffff";
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
     ctx.beginPath();
     ctx.arc(p.x, p.y, 15, 0, Math.PI * 2);
     ctx.stroke();
@@ -233,44 +283,34 @@ function draw() {
     ctx.stroke();
 
     ctx.font = "12px monospace";
-    ctx.fillText("FLT-" + String(p.id).padStart(3, "0"),
-      p.x + 15, p.y - 9);
+    ctx.fillText(p.callsign, p.x + 15, p.y - 9);
   }
 
   requestAnimationFrame(draw);
 }
 
+// The server moves planes 10 times a second; between updates, extrapolate
+// locally so the radar stays smooth. The next server state corrects any drift.
 function animate(now) {
   const dt = Math.min((now - lastTime) / 1000, 0.05);
   lastTime = now;
 
   if (!paused) {
     for (const p of planes) {
-      p.x += p.vx * dt;
-      p.y += p.vy * dt;
-
-      if (p.x < 15 || p.x > canvas.width - 15) p.vx *= -1;
-      if (p.y < 15 || p.y > canvas.height - 15) p.vy *= -1;
-
-      p.x = Math.max(15, Math.min(canvas.width - 15, p.x));
-      p.y = Math.max(15, Math.min(canvas.height - 15, p.y));
+      p.x = Math.max(15, Math.min(canvas.width - 15, p.x + p.vx * dt));
+      p.y = Math.max(15, Math.min(canvas.height - 15, p.y + p.vy * dt));
     }
   }
 
   requestAnimationFrame(animate);
 }
 
-document.getElementById("spawn").addEventListener("click", addPlane);
-document.getElementById("pause").addEventListener("click", event => {
-  paused = !paused;
-  event.target.textContent = paused ? "Resume" : "Pause";
-  log(paused ? "Simulation paused" : "Simulation resumed");
-});
+document.getElementById("spawn").addEventListener("click", () => send("SPAWN_PLANE"));
+pauseButton.addEventListener("click", () => send("TOGGLE_PAUSE"));
 
-addPlane();
-addPlane();
-addPlane();
 log("Tower simulation initialized");
+setStatus(false);
+connect();
 draw();
 requestAnimationFrame(animate);
 </script>
