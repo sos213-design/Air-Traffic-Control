@@ -25,6 +25,7 @@
   h2 { font-size: 16px; margin: 0 0 14px; }
   p { margin: 6px 0; }
   .muted { color: #8da2b9; font-size: 13px; }
+  .muted a { color: inherit; }
 
   main {
     max-width: 600px;
@@ -112,9 +113,9 @@
   <div class="row">
     <div>
       <h1>✈ Pilot Cockpit</h1>
-      <p class="muted">AIR TRAFFIC CONTROL SIMULATOR</p>
+      <p class="muted"><a href="/">AIR TRAFFIC CONTROL SIMULATOR</a></p>
     </div>
-    <span class="pill" id="connection">DEMO MODE</span>
+    <span class="pill" id="connection">OFFLINE</span>
   </div>
 </header>
 
@@ -203,12 +204,18 @@
 const $ = id => document.getElementById(id);
 
 let registered = false;
+let socket = null;
 
 function log(message) {
   const line = document.createElement("div");
   line.className = "log-line";
   line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
   $("log").prepend(line);
+}
+
+function setConnection(online) {
+  $("connection").textContent = online ? "CONNECTED" : "OFFLINE";
+  $("connection").style.background = online ? "#176348" : "#662b35";
 }
 
 function setRegistered(value) {
@@ -220,6 +227,52 @@ function setRegistered(value) {
 
   $("sendCustom").disabled = !value;
   $("status").textContent = value ? "REGISTERED" : "NOT REGISTERED";
+  $("register").textContent = value ? "Update Flight" : "Register Flight";
+}
+
+function send(message) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    log("Not connected to the tower.");
+    return false;
+  }
+  socket.send(JSON.stringify(message));
+  return true;
+}
+
+function handleMessage(message) {
+  if (message.type === "registered") {
+    $("displayCallsign").textContent = message.callsign;
+    $("displayDestination").textContent = message.destination;
+    $("instructions").textContent =
+      "Your aircraft is on the tower radar. Transmit signals below.";
+    setRegistered(true);
+    log(`TOWER: ${message.message}`);
+  } else if (message.type === "ack") {
+    if (message.status) $("status").textContent = message.status.replace(/_/g, " ");
+    log(`TOWER: ${message.message}`);
+  } else if (message.type === "error") {
+    log(`TOWER: ${message.message}`);
+  }
+}
+
+function connect() {
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  socket = new WebSocket(`${protocol}://${location.host}/ws`);
+
+  socket.addEventListener("open", () => {
+    setConnection(true);
+    log("Connected to the tower.");
+  });
+
+  socket.addEventListener("message", event => handleMessage(JSON.parse(event.data)));
+
+  socket.addEventListener("close", () => {
+    // The server removes our plane when the connection drops.
+    if (registered) log("Connection lost. Your aircraft left the radar; register again once reconnected.");
+    setConnection(false);
+    setRegistered(false);
+    setTimeout(connect, 2000);
+  });
 }
 
 $("register").addEventListener("click", () => {
@@ -231,20 +284,15 @@ $("register").addEventListener("click", () => {
     return;
   }
 
-  $("displayCallsign").textContent = callsign.toUpperCase();
-  $("displayDestination").textContent = destination;
-  $("instructions").textContent =
-    "Flight registered locally. Server connection is not implemented yet.";
-
-  setRegistered(true);
-  log(`Demo registration: ${callsign.toUpperCase()} → ${destination}`);
+  if (send({ type: "REGISTER", callsign, destination })) {
+    log(`Requesting registration: ${callsign.toUpperCase()} → ${destination}`);
+  }
 });
 
 function transmit(signal) {
   if (!registered) return;
 
-  // Temporary demo behavior: this does not contact the server.
-  log(`DEMO SIGNAL: ${signal}`);
+  if (send({ type: signal })) log(`TRANSMIT: ${signal}`);
 }
 
 document.querySelectorAll("[data-signal]").forEach(button => {
@@ -262,6 +310,9 @@ $("sendCustom").addEventListener("click", () => {
   transmit(signal);
   $("customSignal").value = "";
 });
+
+setConnection(false);
+connect();
 </script>
 </body>
 </html>

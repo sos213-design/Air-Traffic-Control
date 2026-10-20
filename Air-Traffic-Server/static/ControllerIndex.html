@@ -24,6 +24,7 @@
   }
   h1 { margin: 0; font-size: 21px; }
   .muted { color: #8da2b9; font-size: 13px; }
+  .muted a { color: inherit; }
   .status { color: #1a5fb4; font-size: 13px; }
   main {
     display: grid;
@@ -95,7 +96,7 @@
 <header>
   <div>
     <h1>✈ ATC Control Tower</h1>
-    <div class="muted">MULTIPLAYER AIRSPACE SIMULATOR</div>
+    <div class="muted"><a href="/">MULTIPLAYER AIRSPACE SIMULATOR</a></div>
   </div>
   <div class="status" id="connectionStatus">● CONNECTING…</div>
 </header>
@@ -166,6 +167,15 @@ let paused = false;
 let socket = null;
 let lastTime = performance.now();
 
+// Pilot requests from cockpit devices are highlighted on the radar.
+const STATUS_COLORS = {
+  LAND_REQUESTED: "#f6d32d",
+  CLIMB_REQUESTED: "#8ff0a4",
+  ROUTE_CHANGE_REQUESTED: "#99c1f1",
+  HOLDING: "#ffa348",
+  MAYDAY: "#ff4d5e",
+};
+
 function log(message) {
   const line = document.createElement("div");
   const time = new Date().toLocaleTimeString();
@@ -191,8 +201,10 @@ function applyState(state) {
   const current = new Set(state.planes.map(p => p.id));
 
   for (const p of state.planes) {
-    if (!previous.has(p.id)) log(`Flight ${p.callsign} entered airspace`);
-    else if (p.status !== previous.get(p.id).status) log(`Flight ${p.callsign} ${p.status}`);
+    const old = previous.get(p.id);
+    if (!old) log(`Flight ${p.callsign} entered airspace → ${p.destination}`);
+    else if (p.callsign !== old.callsign) log(`Flight ${old.callsign} is now ${p.callsign}`);
+    else if (p.status !== old.status) log(`Flight ${p.callsign} ${p.status.replace(/_/g, " ")}`);
   }
   for (const p of planes) {
     if (!current.has(p.id)) log(`Flight ${p.callsign} left airspace`);
@@ -267,7 +279,7 @@ function draw() {
 
   // Aircraft markers
   for (const p of planes) {
-    const color = p.status === "LAND_REQUESTED" ? "#f6d32d" : "#ffffff";
+    const color = STATUS_COLORS[p.status] || "#ffffff";
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
     ctx.beginPath();
