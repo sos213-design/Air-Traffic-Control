@@ -215,6 +215,7 @@ const $ = id => document.getElementById(id);
 
 let registered = false;
 let socket = null;
+let warnedOffline = false;
 
 const AIRPORT_NAMES = {
   TOWER: "Main Airport",
@@ -329,6 +330,7 @@ function connect() {
   socket = new WebSocket(`${protocol}://${location.host}/ws`);
 
   socket.addEventListener("open", () => {
+    warnedOffline = false;
     setConnection(true);
     log("Connected to the tower.");
   });
@@ -338,6 +340,10 @@ function connect() {
   socket.addEventListener("close", () => {
     // The server removes our plane when the connection drops.
     if (registered) log("Connection lost. Your aircraft left the radar; register again once reconnected.");
+    else if (!warnedOffline) {
+      log("Can't reach the tower. Check the server is still running and this phone is on the same Wi-Fi with no VPN. Retrying…");
+    }
+    warnedOffline = true;
     setConnection(false);
     setRegistered(false);
     setTimeout(connect, 2000);

@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import math
+import platform
 import random
 import re
 import socket
@@ -369,41 +370,101 @@ async def cockpit():
     return FileResponse(STATIC_DIR / "CockpitIndex.html")
 
 
-def lan_Address():
-    # Connecting a UDP socket sends nothing; it just picks the outgoing interface.
+def lan_Addresses():
+    """This computer's IPv4 addresses that a phone might reach, best guess first."""
+    found = []
+
+    # Connecting a UDP socket sends nothing; it just picks the interface the
+    # computer uses to reach the internet, which is usually the Wi-Fi one.
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
+            found.append(s.getsockname()[0])
     except OSError:
-        return "127.0.0.1"
+        pass
+
+    # Every other adapter, in case that guess is a VPN or virtual network.
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.append(info[4][0])
+    except OSError:
+        pass
+
+    addresses = []
+    for address in found:
+        if address.startswith(("127.", "169.254.")) or address in addresses:
+            continue
+        addresses.append(address)
+    return addresses
 
 
-def cockpit_Url(request: Request):
+def is_Loopback(host):
+    return host in ("localhost", "::1") or host.startswith("127.")
+
+
+def cockpit_Url(scheme, host, port):
+    port = f":{port}" if port else ""
+    return f"{scheme}://{host}{port}/cockpit"
+
+
+def join_Hosts(request: Request):
+    """Addresses to offer phones. A phone can't reach "localhost", so when the
+    page was opened that way, use this computer's network addresses instead."""
     host = request.url.hostname
-    if host in ("localhost", "127.0.0.1", "::1"):
-        # A phone can't reach "localhost", so point the QR code at this
-        # machine's network address instead.
-        host = lan_Address()
-    port = f":{request.url.port}" if request.url.port else ""
-    return f"{request.url.scheme}://{host}{port}/cockpit"
+    if not is_Loopback(host):
+        return [host]
+    return lan_Addresses() or [host]
+
+
+async def accepts_Connections(host, port):
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 1)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    writer.close()
+    return True
+
+
+def running_In_WSL():
+    return "microsoft" in platform.release().lower()
 
 
 @app.get("/api/join")
 async def join_Info(request: Request):
-    return {"url": cockpit_Url(request)}
+    hosts = join_Hosts(request)
+    port = request.url.port or (443 if request.url.scheme == "https" else 80)
+
+    # If the server only listens on 127.0.0.1 (plain `uvicorn AirTrafficMain:app`),
+    # connecting to our own network addresses fails, and so will every phone.
+    checks = [accepts_Connections(h, port) for h in hosts if not is_Loopback(h)]
+    reachable = any(await asyncio.gather(*checks))
+
+    return {
+        "urls": [cockpit_Url(request.url.scheme, h, request.url.port) for h in hosts],
+        "hosts": hosts,
+        "network_reachable": reachable,
+        "wsl": running_In_WSL(),
+    }
 
 
 @app.get("/qr.svg")
-async def join_Qr(request: Request):
+async def join_Qr(request: Request, host: str = ""):
+    hosts = join_Hosts(request)
+    if host not in hosts:
+        host = hosts[0]
+
     image = qrcode.make(
-        cockpit_Url(request),
+        cockpit_Url(request.url.scheme, host, request.url.port),
         image_factory=qrcode.image.svg.SvgPathImage,
         border=2,
     )
     buffer = io.BytesIO()
     image.save(buffer)
-    return Response(buffer.getvalue(), media_type="image/svg+xml")
+    return Response(
+        buffer.getvalue(),
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 async def read_Signal(websocket: WebSocket):
@@ -732,7 +793,35 @@ async def websocket_endpoint(websocket: WebSocket):
         send_locks.pop(websocket, None)
 
 
+def print_Join_Instructions(port):
+    addresses = lan_Addresses()
+    print()
+    print("  Air Traffic Control server")
+    print(f"  Open on this computer:   http://localhost:{port}")
+    for address in addresses:
+        print(f"  Pilots join from phone:  http://{address}:{port}/cockpit")
+
+    if addresses:
+        try:
+            qr = qrcode.QRCode(border=1)
+            qr.add_data(f"http://{addresses[0]}:{port}/cockpit")
+            qr.print_ascii(invert=True)
+        except Exception:
+            pass   # some terminals can't draw the QR code; the URLs above still work
+    else:
+        print("  No network connection found. Connect this computer to Wi-Fi.")
+
+    if running_In_WSL():
+        print("  WARNING: running inside WSL, which phones usually can't reach.")
+        print("  Run this file with Windows Python instead (see README.md).")
+    print("  The phone must be on the same Wi-Fi network as this computer.")
+    print("  If the code above won't scan, use the one on the start page.")
+    print()
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    PORT = 8000
+    print_Join_Instructions(PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
