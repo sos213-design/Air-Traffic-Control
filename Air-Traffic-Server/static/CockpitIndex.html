@@ -271,18 +271,23 @@ function showFlight(plane, queuePosition) {
   $("displayDestination").textContent = AIRPORT_NAMES[plane.destination] || plane.destination;
 
   const climbing = plane.altitude < plane.target_altitude;
-  $("displayAltitude").textContent =
-    `${Math.round(plane.altitude).toLocaleString()} ft${climbing ? " ↑" : ""}`;
+  const descending = plane.altitude > plane.target_altitude;
+  $("displayAltitude").textContent = `${Math.round(plane.altitude).toLocaleString()} ft` +
+    (climbing ? " ↑" : descending ? " ↓" : "");
   $("displayHeading").textContent = String(plane.heading).padStart(3, "0") + "°";
 
-  $("status").textContent = plane.emergency
-    ? "MAYDAY"
+  $("status").textContent = plane.emergency ? "MAYDAY"
+    : plane.conflict ? "TRAFFIC ALERT"
     : plane.status.replace(/_/g, " ");
-  $("status").style.background = plane.emergency ? "#a94050" : "";
+  $("status").style.background = plane.emergency ? "#a94050"
+    : plane.conflict ? "#c64600"
+    : "";
 
   let instructions = STATUS_TEXT[plane.status] || "";
   if (queuePosition) instructions += ` You are number ${queuePosition} for landing.`;
   if (climbing) instructions += ` Climbing to ${plane.target_altitude.toLocaleString()} ft.`;
+  if (descending) instructions += ` Descending to ${plane.target_altitude.toLocaleString()} ft.`;
+  if (plane.conflict) instructions = "Traffic nearby! The tower has turned you away from it; see the radio log.";
   $("instructions").textContent = instructions;
 
   holdButton.textContent = plane.status === "HOLDING"
@@ -320,6 +325,10 @@ function handleMessage(message) {
     log(`TOWER: ${message.message}`);
   } else if (message.type === "ack") {
     log(`TOWER: ${message.message}`);
+  } else if (message.type === "traffic_alert") {
+    log(`⚠ TOWER: ${message.message}`);
+    // Buzz the phone where the browser allows it (Android; not iPhone).
+    if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
   } else if (message.type === "error") {
     log(`TOWER: ${message.message}`);
   }
