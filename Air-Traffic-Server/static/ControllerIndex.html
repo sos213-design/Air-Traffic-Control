@@ -195,12 +195,8 @@ function applyState(state) {
     const old = previous.get(p.id);
     if (!old) log(`Flight ${p.callsign} entered airspace → ${p.destination}`);
     else if (p.callsign !== old.callsign) log(`Flight ${old.callsign} is now ${p.callsign}`);
-    else if (p.status !== old.status) log(`Flight ${p.callsign} ${p.status.replace(/_/g, " ")}`);
     if (old && p.emergency !== old.emergency) {
       log(p.emergency ? `⚠ MAYDAY declared by ${p.callsign}` : `Flight ${p.callsign} cancelled emergency`);
-    }
-    if (old && p.target_altitude > old.target_altitude) {
-      log(`Flight ${p.callsign} climbing to ${p.target_altitude.toLocaleString()} ft`);
     }
   }
   for (const p of planes) {
@@ -209,6 +205,8 @@ function applyState(state) {
     if (p.status === "APPROACH" && airport) log(`Flight ${p.callsign} landed at ${airport.name}`);
     else log(`Flight ${p.callsign} left airspace`);
   }
+
+  for (const call of state.radio) log(`📻 TOWER: ${call}`);
 
   airports = state.airports;
   renderRunways();
@@ -326,11 +324,14 @@ function draw() {
     ctx.stroke();
 
     ctx.font = "12px monospace";
-    ctx.fillText(p.callsign, p.x + 15, p.y - 9);
     const climbing = p.altitude < p.target_altitude;
     const flightLevel = String(Math.round(p.altitude / 100)).padStart(3, "0");
-    ctx.fillText(`FL${flightLevel}${climbing ? "↑" : p.status === "APPROACH" ? "↓" : ""}`,
-      p.x + 15, p.y + 5);
+    const altitudeLabel = `FL${flightLevel}${climbing ? "↑" : p.status === "APPROACH" ? "↓" : ""}`;
+    // Near the right edge, put the labels on the left so they stay visible.
+    const labelWidth = Math.max(ctx.measureText(p.callsign).width, ctx.measureText(altitudeLabel).width);
+    const labelX = p.x + 15 + labelWidth > w ? p.x - 15 - labelWidth : p.x + 15;
+    ctx.fillText(p.callsign, labelX, p.y - 9);
+    ctx.fillText(altitudeLabel, labelX, p.y + 5);
   }
 
   requestAnimationFrame(draw);

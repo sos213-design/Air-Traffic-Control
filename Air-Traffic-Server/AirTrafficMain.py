@@ -43,7 +43,23 @@ for airport in airports.values():
     airport["occupant"] = None   # plane id cleared to land
     airport["queue"] = []        # plane ids waiting for clearance, in order
 
+# Server-flown ("AI") planes repeat one of these signal patterns, waiting
+# AI_DELAY seconds between steps. Each HOLD is later followed by a second
+# HOLD, which leaves the holding pattern. After landing they wait on the
+# ground for AI_GROUND_TIME, then take off for another airport and repeat.
+AI_PATTERNS = [
+    ["ROUTE_CHANGE", "ALT_UP", "HOLD", "HOLD", "LAND_REQUEST"],
+    ["ALT_UP", "ROUTE_CHANGE", "ROUTE_CHANGE", "LAND_REQUEST"],
+    ["HOLD", "ALT_UP", "HOLD", "ROUTE_CHANGE", "LAND_REQUEST"],
+]
+AI_DELAY = (6, 12)
+AI_GROUND_TIME = 5
+
 planes = {}
+ai_planes = {}    # plane id -> {"pattern", "step", "next_at"}
+departures = []   # AI planes on the ground: {"at", "callsign", "airport", "pattern"}
+radio = []        # tower radio calls for the radars, sent with the next state
+sim_time = 0.0    # seconds of simulation; stands still while paused
 holds = {}        # plane id -> {"cx", "cy", "angle"} while circling
 pilots = {}       # plane id -> cockpit websocket
 clients = set()   # radar websockets
@@ -111,10 +127,11 @@ def callsign_Of(plane_id):
     return planes[plane_id]["callsign"] if plane_id in planes else None
 
 
-def state_Message():
+def state_Message(radio_calls=()):
     return json.dumps({
         "type": "state",
         "planes": list(planes.values()),
+        "radio": list(radio_calls),
         "airports": [
             {
                 "code": a["code"],
@@ -151,7 +168,8 @@ async def send_Text(websocket, text):
 
 async def broadcast_State():
     async with state_lock:
-        message = state_Message()
+        message = state_Message(radio)
+        radio.clear()
 
     disconnected = set()
 
@@ -289,24 +307,30 @@ def step_Plane(plane, events):
 
 
 async def simulation_Loop():
+    global sim_time
+
     while True:
         await asyncio.sleep(TICK)
         events = []
 
         async with state_lock:
             if not paused:
+                sim_time += TICK
+
                 for plane in list(planes.values()):
                     if step_Plane(plane, events):
+                        land_AI(plane)
                         remove_Plane(plane["id"])
 
                 # Clear the next plane in line onto any runway that is free.
                 for airport in airports.values():
                     if airport["occupant"] is None and airport["queue"]:
                         plane_id = airport["queue"].pop(0)
-                        events.append((plane_id, {
-                            "type": "ack",
-                            "message": clear_To_Land(plane_id, airport),
-                        }))
+                        message = clear_To_Land(plane_id, airport)
+                        radio.append(message)
+                        events.append((plane_id, {"type": "ack", "message": message}))
+
+                run_AI()
 
             updates = [(pid, flight_Message(pid)) for pid in pilots if pid in planes]
 
@@ -317,8 +341,8 @@ async def simulation_Loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with state_lock:
-        for _ in range(INITIAL_PLANES):
-            create_Plane()
+        for i in range(INITIAL_PLANES):
+            spawn_AI_Plane(AI_PATTERNS[i % len(AI_PATTERNS)])
 
     task = asyncio.create_task(simulation_Loop())
     yield
@@ -421,7 +445,7 @@ async def tower_websocket(websocket: WebSocket):
             # every connected radar within TICK seconds.
             async with state_lock:
                 if signal.get("type") == "SPAWN_PLANE":
-                    create_Plane()
+                    spawn_AI_Plane()
                 elif signal.get("type") == "TOGGLE_PAUSE":
                     paused = not paused
     except WebSocketDisconnect:
@@ -540,30 +564,106 @@ def status_Report(plane):
     )
 
 
+# Signal name -> handler(plane) returning the tower's reply.
+SIGNAL_HANDLERS = {
+    "LAND_REQUEST": request_Landing,
+    "ALT_UP": request_Climb,
+    "ROUTE_CHANGE": request_Route_Change,
+    "HOLD": toggle_Hold,
+    "MAYDAY": toggle_Emergency,
+    "STATUS_REQUEST": status_Report,
+}
+
+
+def transmit(plane, signal_type):
+    """Apply a signal to a plane and put the tower's reply on the radio."""
+    message = SIGNAL_HANDLERS[signal_type](plane)
+    if signal_type != "STATUS_REQUEST":
+        radio.append(message)
+    return message
+
+
+def spawn_AI_Plane(pattern=None):
+    plane = create_Plane(destination=random.choice(list(airports)))
+    add_AI(plane, pattern or random.choice(AI_PATTERNS))
+    return plane
+
+
+def add_AI(plane, pattern):
+    ai_planes[plane["id"]] = {
+        "pattern": pattern,
+        "step": 0,
+        "next_at": sim_time + random.uniform(*AI_DELAY),
+    }
+
+
+def land_AI(plane):
+    """Park a landed AI plane on the ground until it is time to take off."""
+    ai = ai_planes.pop(plane["id"], None)
+    if ai:
+        departures.append({
+            "at": sim_time + AI_GROUND_TIME,
+            "callsign": plane["callsign"],
+            "airport": plane["destination"],
+            "pattern": ai["pattern"],
+        })
+
+
+def take_Off(departure):
+    airport = airports[departure["airport"]]
+    callsign = departure["callsign"]
+    if any(p["callsign"] == callsign for p in planes.values()):
+        callsign = None   # a pilot took the name while we were on the ground
+
+    destination = random.choice([code for code in airports if code != airport["code"]])
+    plane = create_Plane(callsign, destination)
+    plane["x"], plane["y"] = airport["x"], airport["y"]
+    plane["altitude"] = 1000
+    plane["target_altitude"] = random.randint(6, 12) * 1000
+    add_AI(plane, departure["pattern"])
+    radio.append(
+        f"{plane['callsign']}, cleared for takeoff from {airport['name']}, "
+        f"climb to {plane['target_altitude']:,} feet, proceed to "
+        f"{airports[destination]['name']}."
+    )
+
+
+def run_AI():
+    for departure in [d for d in departures if d["at"] <= sim_time]:
+        departures.remove(departure)
+        take_Off(departure)
+
+    for plane_id, ai in list(ai_planes.items()):
+        plane = planes.get(plane_id)
+        if plane is None:
+            del ai_planes[plane_id]
+            continue
+
+        # Once in the landing sequence, just fly it until touchdown.
+        if plane["status"] in ("APPROACH", "AWAITING_CLEARANCE"):
+            continue
+        if sim_time < ai["next_at"]:
+            continue
+
+        signal_type = ai["pattern"][ai["step"]]
+        ai["step"] = (ai["step"] + 1) % len(ai["pattern"])
+        ai["next_at"] = sim_time + random.uniform(*AI_DELAY)
+        transmit(plane, signal_type)
+
+
 async def handle_Pilot_Signal(plane_id, signal_type):
     async with state_lock:
         plane = planes.get(plane_id)
         if plane is None:
             return {"type": "error", "message": "Register your flight first."}
 
-        if signal_type == "LAND_REQUEST":
-            message = request_Landing(plane)
-        elif signal_type == "ALT_UP":
-            message = request_Climb(plane)
-        elif signal_type == "ROUTE_CHANGE":
-            message = request_Route_Change(plane)
-        elif signal_type == "HOLD":
-            message = toggle_Hold(plane)
-        elif signal_type == "MAYDAY":
-            message = toggle_Emergency(plane)
-        elif signal_type == "STATUS_REQUEST":
-            message = status_Report(plane)
-        else:
+        if signal_type not in SIGNAL_HANDLERS:
             return {
                 "type": "error",
                 "message": f"Tower does not recognise signal {signal_type}.",
             }
 
+        message = transmit(plane, signal_type)
         return {"type": "ack", "signal": signal_type, "message": message}
 
 
