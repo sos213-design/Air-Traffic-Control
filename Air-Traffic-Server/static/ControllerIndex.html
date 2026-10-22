@@ -154,6 +154,8 @@ const pauseButton = document.getElementById("pause");
 // to the same server receives the same planes.
 let planes = [];
 let airports = [];
+let conflictPairs = [];   // [[callsign, callsign], ...] currently too close
+let conflictTotal = 0;
 let landings = 0;
 let paused = false;
 let socket = null;
@@ -166,6 +168,8 @@ const STATUS_COLORS = {
   HOLDING: "#ffa348",
 };
 const EMERGENCY_COLOR = "#ff4d5e";
+const CONFLICT_COLOR = "#ff7800";
+const SEPARATION_PX = 50;   // matches the server's 5-mile separation minimum
 
 function log(message) {
   const line = document.createElement("div");
@@ -205,6 +209,13 @@ function applyState(state) {
     if (p.status === "APPROACH" && airport) log(`Flight ${p.callsign} landed at ${airport.name}`);
     else log(`Flight ${p.callsign} left airspace`);
   }
+
+  const known = new Set(conflictPairs.map(pair => pair.join("|")));
+  for (const pair of state.conflicts) {
+    if (!known.has(pair.join("|"))) log(`⚠ CONFLICT: ${pair[0]} and ${pair[1]} losing separation`);
+  }
+  conflictPairs = state.conflicts;
+  conflictTotal = state.conflict_total;
 
   for (const call of state.radio) log(`📻 TOWER: ${call}`);
 
@@ -268,6 +279,7 @@ function renderRunways() {
 function updateStats() {
   document.getElementById("aircraftCount").textContent = planes.length;
   document.getElementById("landingCount").textContent = landings;
+  document.getElementById("conflictCount").textContent = conflictTotal;
 }
 
 function draw() {
@@ -306,9 +318,34 @@ function draw() {
     else ctx.fillText(label, a.x + 14, a.y + 4);
   }
 
+  // Conflicts: a line between each pair, and a flashing ring showing half the
+  // separation minimum around each plane (rings touching = minimum reached).
+  const byCallsign = new Map(planes.map(p => [p.callsign, p]));
+  const flashOn = Math.floor(performance.now() / 400) % 2 === 0;
+  ctx.strokeStyle = CONFLICT_COLOR;
+  ctx.fillStyle = CONFLICT_COLOR;
+  ctx.lineWidth = 2;
+  for (const [a, b] of conflictPairs.map(pair => pair.map(c => byCallsign.get(c)))) {
+    if (!a || !b) continue;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.setLineDash([]);
+    const miles = (Math.hypot(a.x - b.x, a.y - b.y) / 10).toFixed(1);
+    ctx.font = "11px monospace";
+    ctx.fillText(`${miles} nm`, (a.x + b.x) / 2 + 6, (a.y + b.y) / 2 - 6);
+    if (flashOn) {
+      for (const p of [a, b]) {
+        ctx.beginPath(); ctx.arc(p.x, p.y, SEPARATION_PX / 2, 0, Math.PI * 2); ctx.stroke();
+      }
+    }
+  }
+  ctx.lineWidth = 1;
+
   // Aircraft markers
   for (const p of planes) {
-    const color = p.emergency ? EMERGENCY_COLOR : STATUS_COLORS[p.status] || "#ffffff";
+    const color = p.emergency ? EMERGENCY_COLOR
+      : p.conflict ? CONFLICT_COLOR
+      : STATUS_COLORS[p.status] || "#ffffff";
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
     ctx.beginPath();
@@ -326,7 +363,8 @@ function draw() {
     ctx.font = "12px monospace";
     const climbing = p.altitude < p.target_altitude;
     const flightLevel = String(Math.round(p.altitude / 100)).padStart(3, "0");
-    const altitudeLabel = `FL${flightLevel}${climbing ? "↑" : p.status === "APPROACH" ? "↓" : ""}`;
+    const descending = p.altitude > p.target_altitude || p.status === "APPROACH";
+    const altitudeLabel = `FL${flightLevel}${climbing ? "↑" : descending ? "↓" : ""}`;
     // Near the right edge, put the labels on the left so they stay visible.
     const labelWidth = Math.max(ctx.measureText(p.callsign).width, ctx.measureText(altitudeLabel).width);
     const labelX = p.x + 15 + labelWidth > w ? p.x - 15 - labelWidth : p.x + 15;

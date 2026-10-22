@@ -34,6 +34,15 @@ MAX_ALTITUDE = 40000
 HOLD_RADIUS = 30          # px
 APPROACH_SPEED = 30       # px per second
 
+# Conflict detection: two planes are in conflict when they are, or will be
+# within LOOKAHEAD seconds on their current tracks, closer than
+# SEPARATION_PX horizontally while less than VERTICAL_SEPARATION apart.
+SEPARATION_PX = 5 * PX_PER_NM
+VERTICAL_SEPARATION = 1000
+LOOKAHEAD = 5
+RESOLUTION_COOLDOWN = 6   # seconds before the same plane gets another instruction
+CONFLICT_DISPLAY = 4      # seconds a conflict stays highlighted after it was last seen
+
 # Destination code (as sent by the cockpit) -> airport. Each has one runway.
 airports = {
     "TOWER": {"code": "TOWER", "name": "Main Airport", "runway": "RWY 09", "x": 400, "y": 270},
@@ -61,6 +70,9 @@ ai_planes = {}    # plane id -> {"pattern", "step", "next_at"}
 departures = []   # AI planes on the ground: {"at", "callsign", "airport", "pattern"}
 radio = []        # tower radio calls for the radars, sent with the next state
 sim_time = 0.0    # seconds of simulation; stands still while paused
+conflicts = {}            # frozenset({plane id, plane id}) -> sim_time last detected
+conflict_total = 0
+resolved_until = {}       # plane id -> sim_time of its last instruction + cooldown
 holds = {}        # plane id -> {"cx", "cy", "angle"} while circling
 pilots = {}       # plane id -> cockpit websocket
 clients = set()   # radar websockets
@@ -102,6 +114,7 @@ def create_Plane(callsign=None, destination="TOWER"):
         "target_altitude": 0,
         "status": "AIRBORNE",
         "emergency": False,
+        "conflict": False,
     }
     plane["target_altitude"] = plane["altitude"]
     set_Heading(plane, random.randint(0, 359), 15 + random.random() * 15)
@@ -122,6 +135,7 @@ def remove_Plane(plane_id):
     if plane_id in planes:
         leave_Sequence(planes.pop(plane_id))
     holds.pop(plane_id, None)
+    resolved_until.pop(plane_id, None)
 
 
 def callsign_Of(plane_id):
@@ -145,6 +159,12 @@ def state_Message(radio_calls=()):
             }
             for a in airports.values()
         ],
+        "conflicts": [
+            sorted(callsign_Of(pid) for pid in pair)
+            for pair in conflicts
+            if all(pid in planes for pid in pair)
+        ],
+        "conflict_total": conflict_total,
         "paused": paused,
         "landings": landings,
     })
@@ -291,11 +311,17 @@ def step_Plane(plane, events):
         plane["y"] = max(MIN_Y, min(MAX_Y, plane["y"]))
         plane["heading"] = heading_Of(plane["vx"], plane["vy"])
 
-    if plane["altitude"] < plane["target_altitude"]:
-        plane["altitude"] = min(
-            plane["target_altitude"],
-            plane["altitude"] + CLIMB_RATE * TICK,
-        )
+    if plane["altitude"] != plane["target_altitude"]:
+        if plane["altitude"] < plane["target_altitude"]:
+            plane["altitude"] = min(
+                plane["target_altitude"],
+                plane["altitude"] + CLIMB_RATE * TICK,
+            )
+        else:
+            plane["altitude"] = max(
+                plane["target_altitude"],
+                plane["altitude"] - CLIMB_RATE * TICK,
+            )
         if plane["altitude"] == plane["target_altitude"]:
             events.append((plane_id, {
                 "type": "ack",
@@ -305,6 +331,140 @@ def step_Plane(plane, events):
                 ),
             }))
     return False
+
+
+def predicted_Position(plane, t):
+    """Where the plane will be (x, y, altitude) in t seconds."""
+    if plane["status"] == "APPROACH":
+        airport = airports[plane["destination"]]
+        distance = math.hypot(airport["x"] - plane["x"], airport["y"] - plane["y"])
+        progress = min(1, APPROACH_SPEED * t / distance) if distance else 1
+        return (
+            plane["x"] + (airport["x"] - plane["x"]) * progress,
+            plane["y"] + (airport["y"] - plane["y"]) * progress,
+            plane["altitude"] * (1 - progress),
+        )
+
+    change = plane["target_altitude"] - plane["altitude"]
+    altitude = plane["altitude"] + max(-CLIMB_RATE * t, min(CLIMB_RATE * t, change))
+    if plane["id"] in holds:
+        # Circling planes stay roughly where they are.
+        return plane["x"], plane["y"], altitude
+    return plane["x"] + plane["vx"] * t, plane["y"] + plane["vy"] * t, altitude
+
+
+def in_Conflict(a, b):
+    """True if the planes break separation now or within LOOKAHEAD seconds."""
+    steps = int(LOOKAHEAD / 0.5)
+    for i in range(steps + 1):
+        ax, ay, a_alt = predicted_Position(a, i * 0.5)
+        bx, by, b_alt = predicted_Position(b, i * 0.5)
+        if (abs(a_alt - b_alt) < VERTICAL_SEPARATION
+                and math.hypot(ax - bx, ay - by) < SEPARATION_PX):
+            return True
+    return False
+
+
+def detect_Conflicts():
+    found = set()
+    ids = list(planes)
+    for i, a_id in enumerate(ids):
+        for b_id in ids[i + 1:]:
+            if in_Conflict(planes[a_id], planes[b_id]):
+                found.add(frozenset((a_id, b_id)))
+    return found
+
+
+def resolve_Conflict(plane, other):
+    """Course change that moves `plane` away from `other`, or None."""
+    # Landing traffic keeps its approach; the other plane gives way.
+    if plane["status"] == "APPROACH":
+        return None
+
+    miles = math.hypot(plane["x"] - other["x"], plane["y"] - other["y"]) / PX_PER_NM
+    alert = f"{plane['callsign']}, traffic alert, {other['callsign']} {miles:.0f} miles"
+
+    # A circling plane breaks off its hold to turn away, and goes back to
+    # holding once it is clear (see resume_Holds).
+    holding = plane["id"] in holds
+    holds.pop(plane["id"], None)
+
+    # Turn up to 90 degrees toward the bearing that points away from the
+    # other plane. Head-on, both turn right.
+    away = heading_Of(plane["x"] - other["x"], plane["y"] - other["y"])
+    turn = (away - plane["heading"] + 540) % 360 - 180
+    if abs(turn) >= 170:
+        turn = 90
+    turn = max(-90, min(90, turn))
+    if abs(turn) < 30:
+        turn = 30 if turn >= 0 else -30
+
+    new_heading = round((plane["heading"] + turn) / 5) * 5 % 360
+    set_Heading(plane, new_heading)
+    direction = "right" if turn > 0 else "left"
+    message = f"{alert}. Turn {direction} heading {new_heading:03d}"
+
+    # Landing traffic only descends, so a plane above it also climbs away.
+    if other["status"] == "APPROACH" and plane["altitude"] >= other["altitude"]:
+        target = round(plane["altitude"] + 2 * VERTICAL_SEPARATION, -3)
+        if plane["target_altitude"] < target <= MAX_ALTITUDE:
+            plane["target_altitude"] = target
+            message += f" and climb to {target:,} feet"
+
+    message += " immediately"
+    if holding:
+        message += ", then re-enter the hold when clear"
+    return message + "."
+
+
+def resume_Holds():
+    """Planes turned out of a hold start circling again once clear."""
+    for plane in planes.values():
+        if (plane["status"] in ("HOLDING", "AWAITING_CLEARANCE")
+                and plane["id"] not in holds
+                and sim_time >= resolved_until.get(plane["id"], 0)):
+            start_Hold(plane)
+
+
+def handle_Conflicts(events):
+    global conflicts, conflict_total
+
+    resume_Holds()
+
+    found = detect_Conflicts()
+    conflict_total += len(found - conflicts.keys())
+
+    # Keep each conflict on the radar for a moment after the turn resolves
+    # it, so controllers and pilots can see what happened.
+    conflicts = {
+        pair: seen for pair, seen in conflicts.items()
+        if sim_time - seen < CONFLICT_DISPLAY and all(pid in planes for pid in pair)
+    }
+    for pair in found:
+        conflicts[pair] = sim_time
+
+    involved = set().union(*conflicts) if conflicts else set()
+    for plane in planes.values():
+        plane["conflict"] = plane["id"] in involved
+
+    for pair in found:
+        a_id, b_id = pair
+        for plane_id, other_id in ((a_id, b_id), (b_id, a_id)):
+            if sim_time < resolved_until.get(plane_id, 0):
+                continue
+
+            message = resolve_Conflict(planes[plane_id], planes[other_id])
+            if message is None:
+                continue
+
+            resolved_until[plane_id] = sim_time + RESOLUTION_COOLDOWN
+            radio.append(message)
+            events.append((plane_id, {"type": "traffic_alert", "message": message}))
+
+            # Don't let the AI's own pattern turn it straight back.
+            if plane_id in ai_planes:
+                ai = ai_planes[plane_id]
+                ai["next_at"] = max(ai["next_at"], sim_time + RESOLUTION_COOLDOWN)
 
 
 async def simulation_Loop():
@@ -331,6 +491,7 @@ async def simulation_Loop():
                         radio.append(message)
                         events.append((plane_id, {"type": "ack", "message": message}))
 
+                handle_Conflicts(events)
                 run_AI()
 
             updates = [(pid, flight_Message(pid)) for pid in pilots if pid in planes]
