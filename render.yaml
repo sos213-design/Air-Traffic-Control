@@ -1,0 +1,11 @@
+# Render (https://render.com) setup for putting the game online.
+# See "Share a link with anyone" in README.md.
+services:
+  - type: web
+    name: air-traffic-control
+    runtime: python
+    plan: free
+    rootDir: Air-Traffic-Server
+    buildCommand: pip install -r requirements.txt
+    startCommand: python AirTrafficMain.py
+    healthCheckPath: /

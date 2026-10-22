@@ -2,17 +2,19 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Air Traffic Control</title>
     <style>
         body {
             font-family: Arial, sans-serif;
             text-align: center;
-            padding-top: 50px;
+            padding: 50px 16px 0;
             background: linear-gradient(to bottom, #080172, #000);
             color: white;
             min-height: 100vh;
             margin: 0;
             position: relative;
+            box-sizing: border-box;
         }
         #radar-container {
             position: absolute;
@@ -21,24 +23,49 @@
             width: 100%;
             height: 100%;
             z-index: -1;
+            overflow: hidden;
         }
-        #qr-code {
-            width: 200px;
-            height: 200px;
-            margin: 20px auto 8px;
-            padding: 8px;
-            display: block;
-            background: #fff;
+        .links {
+            max-width: 620px;
+            margin: 24px auto 8px;
+            text-align: left;
+        }
+        .link-label {
+            font-size: 14px;
+            color: #8da2b9;
+            margin: 14px 0 6px;
+        }
+        .link-row {
+            display: flex;
+            gap: 8px;
+            align-items: stretch;
+        }
+        .link-row code {
+            flex: 1;
+            min-width: 0;
+            padding: 12px;
+            border: 1px solid #1a5fb4;
             border-radius: 8px;
-        }
-        #join-url {
-            font-family: monospace;
+            background: rgba(0, 0, 0, 0.55);
             color: #99c1f1;
+            font-size: 16px;
             overflow-wrap: anywhere;
         }
+        .link-row button {
+            min-width: 96px;
+            padding: 0 18px;
+            border: 1px solid #1a5fb4;
+            border-radius: 8px;
+            background: #1a5fb4;
+            color: white;
+            font-size: 15px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .link-row button:hover { background: #2a6fc4; }
         #start-button {
             display: inline-block;
-            margin: 20px 0 10px;
+            margin: 24px 0 10px;
             padding: 14px 28px;
             border: 1px solid #1a5fb4;
             border-radius: 8px;
@@ -51,8 +78,17 @@
         #start-button:hover { background: #2a6fc4; }
         a { color: #99c1f1; }
         .muted { color: #8da2b9; font-size: 14px; }
+        .note {
+            max-width: 620px;
+            margin: 12px auto;
+            padding: 10px 14px;
+            text-align: left;
+            background: rgba(0, 0, 0, 0.55);
+            border-radius: 8px;
+            box-sizing: border-box;
+        }
         .warning {
-            max-width: 560px;
+            max-width: 620px;
             margin: 16px auto;
             padding: 12px 16px;
             border: 1px solid #a94050;
@@ -60,33 +96,11 @@
             background: rgba(102, 43, 53, 0.85);
             text-align: left;
         }
-        .warning code, #help code {
+        code.inline {
             background: rgba(0, 0, 0, 0.4);
             padding: 1px 5px;
             border-radius: 4px;
         }
-        #help {
-            max-width: 560px;
-            margin: 10px auto;
-            text-align: left;
-            background: rgba(0, 0, 0, 0.45);
-            border: 1px solid #1a5fb4;
-            border-radius: 8px;
-            padding: 10px 16px;
-        }
-        #help summary { cursor: pointer; font-weight: bold; }
-        #help li { margin: 6px 0; }
-        #addresses button {
-            margin: 3px;
-            padding: 6px 10px;
-            border: 1px solid #1a5fb4;
-            border-radius: 6px;
-            background: transparent;
-            color: white;
-            font-family: monospace;
-            cursor: pointer;
-        }
-        #addresses button.selected { background: #1a5fb4; }
         [hidden] { display: none !important; }
     </style>
 </head>
@@ -105,77 +119,105 @@
         </svg>
     </div>
     <h1>Welcome to the Air Traffic Control Simulator</h1>
-    <p>Please scan the QR code below to connect your device.</p>
+    <p>Send pilots the link below. They open it in their web browser to fly.</p>
+
     <div class="warning" id="file-warning" hidden>
         <strong>This page was opened as a file, so it can't reach the server.</strong>
-        <p>Start the server by running <code>python AirTrafficMain.py</code> in the
-        <code>Air-Traffic-Server</code> folder, then open
+        <p>Start the server by running <code class="inline">python AirTrafficMain.py</code>
+        in the <code class="inline">Air-Traffic-Server</code> folder, then open
         <a href="http://localhost:8000">http://localhost:8000</a> in your browser.</p>
     </div>
     <div class="warning" id="network-warning" hidden>
-        <strong>Phones can't reach this server yet.</strong>
+        <strong>Other computers can't reach this server yet.</strong>
         <p>It is only listening on this computer. Stop it (Ctrl+C) and start it with
-        <code>python AirTrafficMain.py</code>, or add <code>--host 0.0.0.0</code>
-        if you use the <code>uvicorn</code> command.</p>
+        <code class="inline">python AirTrafficMain.py</code>, or add
+        <code class="inline">--host 0.0.0.0</code> if you use the
+        <code class="inline">uvicorn</code> command.</p>
     </div>
     <div class="warning" id="wsl-warning" hidden>
         <strong>The server is running inside WSL.</strong>
-        <p>Phones usually can't reach programs in WSL. Install Python for Windows and run
-        <code>python AirTrafficMain.py</code> from a normal Windows terminal instead.</p>
+        <p>Other computers usually can't reach programs in WSL. Install Python for Windows
+        and run <code class="inline">python AirTrafficMain.py</code> from a normal Windows
+        terminal instead.</p>
     </div>
-    <img id="qr-code" src="/qr.svg" alt="QR code to join as a pilot">
-    <p class="muted">or type <a id="join-url" href="/cockpit">/cockpit</a> into your phone's browser</p>
-    <details id="help">
-        <summary>Phone can't connect?</summary>
-        <ol>
-            <li>Put the phone on the <strong>same Wi-Fi</strong> as this computer.
-                Turn off mobile data, and don't use a guest network.</li>
-            <li>Allow Python through the firewall. On Windows: Start → "Allow an app through
-                Windows Firewall" → Change settings → tick <strong>Private</strong> (and
-                <strong>Public</strong> if your Wi-Fi is marked Public) for every
-                <strong>Python</strong> entry.</li>
-            <li>On the phone, type the address exactly as shown, starting with
-                <code>http://</code> (not https).</li>
-            <li id="address-step" hidden>This computer has more than one network address.
-                If one doesn't work, pick another to update the QR code:
-                <div id="addresses"></div></li>
-            <li>Turn off any VPN on this computer or the phone.</li>
-        </ol>
-    </details>
+
+    <div class="links">
+        <div class="link-label">Pilot link: send this to pilots</div>
+        <div class="link-row">
+            <code id="pilot-link">…</code>
+            <button data-copy="pilot-link">Copy</button>
+        </div>
+        <div class="link-label">Control tower link: for anyone who wants to watch the radar</div>
+        <div class="link-row">
+            <code id="tower-link">…</code>
+            <button data-copy="tower-link">Copy</button>
+        </div>
+    </div>
+
+    <p class="note muted" id="online-note" hidden>
+        The server is online, so anyone with these links can join from anywhere.
+    </p>
+    <p class="note muted" id="local-note" hidden>
+        These links only work for computers on the same network as this one. To get a
+        link that works for anyone, anywhere, put the server online: see
+        <strong>"Share a link with anyone"</strong> in README.md.
+        <span id="other-addresses"></span>
+    </p>
+
     <p><span id="aircraft-count">0</span> aircraft in the airspace</p>
     <a id="start-button" href="/tower">Start Control Tower</a>
+    <p><a href="/cockpit">Fly as a pilot on this computer</a></p>
+
     <script>
         if (location.protocol === "file:") {
             document.getElementById("file-warning").hidden = false;
-            document.getElementById("qr-code").hidden = true;
         }
 
-        function showJoinAddress(host, url) {
-            const link = document.getElementById("join-url");
-            link.href = url;
-            link.textContent = url;
-            document.getElementById("qr-code").src = `/qr.svg?host=${encodeURIComponent(host)}`;
-            for (const button of document.querySelectorAll("#addresses button")) {
-                button.classList.toggle("selected", button.dataset.host === host);
-            }
+        function showLinks(pilotUrl) {
+            document.getElementById("pilot-link").textContent = pilotUrl;
+            document.getElementById("tower-link").textContent = pilotUrl.replace(/\/cockpit$/, "/tower");
         }
+
+        // Copy to clipboard. The clipboard API only works on https or localhost,
+        // so fall back to selecting the text and using the older copy command.
+        for (const button of document.querySelectorAll("[data-copy]")) {
+            button.addEventListener("click", async () => {
+                const box = document.getElementById(button.dataset.copy);
+                try {
+                    await navigator.clipboard.writeText(box.textContent);
+                } catch {
+                    const range = document.createRange();
+                    range.selectNodeContents(box);
+                    getSelection().removeAllRanges();
+                    getSelection().addRange(range);
+                    document.execCommand("copy");
+                }
+                button.textContent = "Copied!";
+                setTimeout(() => { button.textContent = "Copy"; }, 1500);
+            });
+        }
+
+        // Opened through a real address (e.g. online), the links are this site's own.
+        showLinks(`${location.origin}/cockpit`);
 
         fetch("/api/join")
             .then(response => response.json())
             .then(info => {
-                document.getElementById("network-warning").hidden = info.network_reachable;
                 document.getElementById("wsl-warning").hidden = !info.wsl;
+                if (info.online) {
+                    document.getElementById("online-note").hidden = false;
+                    return;
+                }
+                document.getElementById("local-note").hidden = false;
+                if (!info.local) return;
 
-                const addresses = document.getElementById("addresses");
-                info.hosts.forEach((host, i) => {
-                    const button = document.createElement("button");
-                    button.textContent = host;
-                    button.dataset.host = host;
-                    button.addEventListener("click", () => showJoinAddress(host, info.urls[i]));
-                    addresses.append(button);
-                });
-                document.getElementById("address-step").hidden = info.hosts.length < 2;
-                showJoinAddress(info.hosts[0], info.urls[0]);
+                // Opened as localhost: give pilots this computer's network address.
+                document.getElementById("network-warning").hidden = info.network_reachable;
+                showLinks(info.urls[0]);
+                if (info.urls.length > 1) {
+                    document.getElementById("other-addresses").textContent =
+                        ` If the link doesn't work, try: ${info.urls.slice(1).join(", ")}`;
+                }
             })
             .catch(() => {});
 
@@ -191,7 +233,7 @@
             });
             socket.addEventListener("close", () => setTimeout(watchAirspace, 2000));
         }
-        watchAirspace();
+        if (location.protocol !== "file:") watchAirspace();
     </script>
 </body>
 </html>
