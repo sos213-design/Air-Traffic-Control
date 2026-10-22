@@ -327,8 +327,6 @@ function handleMessage(message) {
     log(`TOWER: ${message.message}`);
   } else if (message.type === "traffic_alert") {
     log(`⚠ TOWER: ${message.message}`);
-    // Buzz the phone where the browser allows it (Android; not iPhone).
-    if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
   } else if (message.type === "error") {
     log(`TOWER: ${message.message}`);
   }
@@ -350,7 +348,7 @@ function connect() {
     // The server removes our plane when the connection drops.
     if (registered) log("Connection lost. Your aircraft left the radar; register again once reconnected.");
     else if (!warnedOffline) {
-      log("Can't reach the tower. Check the server is still running and this phone is on the same Wi-Fi with no VPN. Retrying…");
+      log("Can't reach the tower. The server may have stopped, or this computer can't reach it. Ask the host for a fresh link. Retrying…");
     }
     warnedOffline = true;
     setConnection(false);
